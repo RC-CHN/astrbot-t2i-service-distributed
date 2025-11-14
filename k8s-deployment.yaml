@@ -1,0 +1,153 @@
+# k8s-deployment.yaml
+
+# 1. Secret for MinIO credentials
+# Note: In a real production environment, you should generate these values securely.
+# The values here are 'minioadmin' base64 encoded.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-credentials
+type: Opaque
+data:
+  MINIO_ROOT_USER: bWluaW9hZG1pbg==
+  MINIO_ROOT_PASSWORD: bWluaW9hZG1pbg==
+
+---
+
+# 2. Persistent Volume Claim for MinIO data storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi # Adjust storage size as needed
+
+---
+
+# 3. StatefulSet for MinIO (1 replica)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: minio
+spec:
+  serviceName: "minio-service"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:latest
+          args:
+            - server
+            - /data
+            - --console-address
+            - ":9001"
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: MINIO_ROOT_USER
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: MINIO_ROOT_PASSWORD
+          ports:
+            - containerPort: 9000
+              name: api
+            - containerPort: 9001
+              name: console
+          volumeMounts:
+            - name: storage
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: storage
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 100Gi # Must match the PVC size
+
+---
+
+# 4. ClusterIP Service for MinIO (internal access)
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-service
+spec:
+  type: ClusterIP
+  selector:
+    app: minio
+  ports:
+    - protocol: TCP
+      port: 9000
+      targetPort: 9000
+
+---
+
+# 5. Deployment for the Text2Image App (2 replicas)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: text2img-deployment
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: text2img
+  template:
+    metadata:
+      labels:
+        app: text2img
+    spec:
+      containers:
+        - name: text2img-app
+          image: rc0x01/astrbot-t2i-service-distributed:latest # Your image on Docker Hub
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8999
+          env:
+            - name: S3_ENDPOINT_URL
+              value: "http://minio-service:9000"
+            - name: S3_BUCKET_NAME
+              value: "text2img"
+            - name: S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: MINIO_ROOT_USER
+            - name: S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: MINIO_ROOT_PASSWORD
+
+---
+
+# 6. NodePort Service to expose the App
+apiVersion: v1
+kind: Service
+metadata:
+  name: text2img-service
+spec:
+  type: NodePort
+  selector:
+    app: text2img
+  ports:
+    - protocol: TCP
+      port: 8999
+      targetPort: 8999
+      # nodePort: 30007 # You can optionally specify a port, otherwise K8s will assign one.
