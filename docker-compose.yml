@@ -2,6 +2,7 @@ version: '3.8'
 
 services:
   app:
+    image: rc0x01/astrbot-t2i-service-distributed:latest
     build: .
     ports:
       - "8999:8999"
