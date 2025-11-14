@@ -107,23 +107,30 @@ class AsyncEndpointTester:
             # --- 步骤 1: 发送 POST 请求获取任务 ID ---
             print("[*] 步骤 1/2: 发送 POST 请求获取任务 ID...")
             async with aiohttp.ClientSession(trust_env=True, connector=connector) as session:
+                # --- 步骤 1: 发送 POST 请求获取任务 ID ---
+                print("[*] 步骤 1/2: 发送 POST 请求获取任务 ID...")
                 async with session.post(
                     f"{self.endpoint_url}/generate", json=post_data, timeout=30
                 ) as resp:
                     if resp.status != 200:
-                        raise Exception(f"获取任务ID失败，HTTP {resp.status}, 响应: {await resp.text()}")
+                        # 尝试解析为 JSON 以获取更详细的错误信息
+                        try:
+                            error_json = await resp.json()
+                            error_message = error_json.get("message", await resp.text())
+                        except Exception:
+                            error_message = await resp.text()
+                        raise Exception(f"获取任务ID失败，HTTP {resp.status}, 响应: {error_message}")
                     
                     result_json = await resp.json()
                     task_id = result_json.get("data", {}).get("id")
                     if not task_id:
                         raise Exception(f"响应中未找到任务 ID (data.id)。收到的 JSON: {result_json}")
-            
-            print(f"[*] 成功获取任务 ID: {task_id}")
+                
+                print(f"[*] 成功获取任务 ID: {task_id}")
 
-            # --- 步骤 2: 使用任务 ID 发送 GET 请求下载图片 ---
-            image_url = f"{self.endpoint_url}/{task_id}"
-            print(f"[*] 步骤 2/2: 发送 GET 请求到 {image_url} 下载图片...")
-            async with aiohttp.ClientSession(trust_env=True, connector=connector) as session:
+                # --- 步骤 2: 使用任务 ID 发送 GET 请求下载图片 ---
+                image_url = f"{self.endpoint_url}/data/{task_id.replace('data/', '', 1)}"
+                print(f"[*] 步骤 2/2: 发送 GET 请求到 {image_url} 下载图片...")
                 async with session.get(image_url, timeout=60) as resp: # 下载允许更长时间
                     return await download_image_from_response(resp)
 

@@ -1,7 +1,7 @@
 import fastapi
 import os
 import asyncio
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from jinja2.exceptions import SecurityError
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi import BackgroundTasks
@@ -20,7 +20,7 @@ class GenerateRequest(BaseModel):
     tmplname: str | None = None
     tmpldata: dict | None = None
     options: ScreenshotOptions | None = None
-    as_json: bool = False
+    as_json: bool = Field(default=False, alias="json")
 
 
 @app.get("/text2img/data/{image_path:path}")
