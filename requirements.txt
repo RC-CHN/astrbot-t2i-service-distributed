@@ -3,3 +3,5 @@ fastapi
 uvicorn
 jinja2
 loguru
+boto3
+pydantic-settings
