@@ -41,7 +41,7 @@
     # curl "http://localhost:8999/text2img/data/{id}" --output fetched.png
     ```
 
-## 环境变量配置
+A simple web service that converts HTML/templates to images, with image lifecycle management support.
 
 服务通过环境变量进行配置，支持从 `.env` 文件加载。
 
@@ -60,7 +60,10 @@
 |---|---|---|
 | `PORT` | 服务端口 | `8999` |
 
-## API 接口
+- `PORT`: Service port, default is 8999
+- `IMAGE_LIFETIME_HOURS`: Image lifetime in hours, default is 24 hours. Images older than this will be automatically cleaned up
+
+## API Endpoints
 
 ### POST /text2img/generate
 
