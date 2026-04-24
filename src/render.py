@@ -217,7 +217,9 @@ class Text2ImgRender:
             logger.info(f"html2pic: set viewport width to {viewport_width}")
 
         try:
-            await page.goto(f"file://{html_file_path}")
+            await page.goto(
+                f"file://{html_file_path}", timeout=screenshot_options.timeout
+            )
             screenshot_kwargs = screenshot_options.model_dump(exclude_none=True)
             screenshot_kwargs.pop("viewport_width", None)
             screenshot_kwargs.pop("device_scale_factor_level", None)
