@@ -77,18 +77,32 @@ A simple web service that converts HTML/templates to images, with image lifecycl
 -   `bool` `as_json`: 是否返回 JSON 格式（返回一个图片 ID）。默认为 `false`。
 -   `dict` `options`: 截图选项（可选）。
 
-**响应**:
--   当 `as_json=false` 时：直接返回图片文件的二进制流。
--   当 `as_json=true` 时：返回 JSON 格式，包含图片的 ID。
-    ```json
-    {
-      "code": 0,
-      "message": "success",
-      "data": {
-        "id": "data/rendered_1678886400_abcdef12.png"
-      }
-    }
-    ```
+- `str` html: HTML text
+- `str` tmpl: Jinja2 HTML template
+- `dict` tmpldata: Jinja2 template data
+- `bool` json: Whether to return JSON format (returns an id)
+- `dict` `optional` options
+  - timeout (float, optional): Screenshot timeout.
+  - type (Literal["jpeg", "png"], optional): Screenshot image type.
+  - quality (int, optional): Screenshot quality, only applicable to JPEG format.
+  - omit_background (bool, optional): Whether to hide the default white background, allowing transparent screenshots (PNG only).
+  - full_page (bool, optional): Whether to capture the entire page instead of just the viewport, default is True.
+  - clip (FloatRect, optional): Area to clip after screenshot, xy is the starting point.
+  - animations: (Literal["allow", "disabled"], optional): Whether to allow CSS animations.
+  - caret: (Literal["hide", "initial"], optional): When set to `hide`, the text caret will be hidden during screenshot, default is `hide`.
+  - scale: (Literal["css", "device"], optional): Page scaling settings. When set to `css`, device resolution maps 1:1 with CSS pixels, making screenshots smaller on high-DPI screens. When set to `device`, scales according to device screen scaling or the device_scale_factor parameter in the current Playwright Page/Context.
+  - viewport_width (int, optional): Custom viewport width to control screenshot width. Resolved in priority order:
+    1. Explicitly set in request options
+    2. Auto-parsed from `<meta name="viewport" content="width=...">` in HTML
+    3. Defaults to 800px if not specified and no meta tag found
+  - viewport_height (int, optional): Custom viewport height to control screenshot height. Resolved in priority order:
+    1. Explicitly set in request options
+    2. Auto-parsed from `<meta name="viewport" content="height=...">` in HTML
+    3. Defaults to 600px if not specified and no meta tag found
+  - device_scale_factor_level (Literal["normal", "high", "ultra"], optional): Device pixel ratio level, default is "normal". Different levels use independent browser context pools for better performance and resource isolation.
+    - `normal`: Device pixel ratio 1.0 (default)
+    - `high`: Device pixel ratio 1.3
+    - `ultra`: Device pixel ratio 1.8
 
 ### GET /text2img/data/{id}
 
