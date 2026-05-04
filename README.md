@@ -98,7 +98,7 @@ A simple web service that converts HTML/templates to images, with image lifecycl
   - viewport_height (int, optional): Custom viewport height to control screenshot height. Resolved in priority order:
     1. Explicitly set in request options
     2. Auto-parsed from `<meta name="viewport" content="height=...">` in HTML
-    3. Defaults to 600px if not specified and no meta tag found
+    3. Defaults to 720px if not specified and no meta tag found
   - device_scale_factor_level (Literal["normal", "high", "ultra"], optional): Device pixel ratio level, default is "normal". Different levels use independent browser context pools for better performance and resource isolation.
     - `normal`: Device pixel ratio 1.0 (default)
     - `high`: Device pixel ratio 1.3
