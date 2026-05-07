@@ -60,7 +60,7 @@ class TestScreenshotOptions:
 
 
 class TestRenderResolveViewport:
-    """Tests for the _resolve_viewport_width method."""
+    """Tests for the _resolve_viewport_size method (returns (width, height) tuple)."""
 
     @pytest.fixture
     def render(self):
@@ -76,8 +76,9 @@ class TestRenderResolveViewport:
         html_file = tmp_path / "test.html"
         html_file.write_text("<html><head></head><body></body></html>")
 
-        result = render._resolve_viewport_width(str(html_file), opts)
-        assert result == 1024
+        width, height = render._resolve_viewport_size(str(html_file), opts)
+        assert width == 1024
+        assert height is None
 
     def test_auto_detect_from_meta_tag(self, render, tmp_path):
         """Should parse width from <meta name="viewport" content="width=XXX">."""
@@ -89,8 +90,9 @@ class TestRenderResolveViewport:
             '<html><head><meta name="viewport" content="width=600"></head><body></body></html>'
         )
 
-        result = render._resolve_viewport_width(str(html_file), opts)
-        assert result == 600
+        width, height = render._resolve_viewport_size(str(html_file), opts)
+        assert width == 600
+        assert height is None
 
     def test_auto_detect_with_extra_content(self, render, tmp_path):
         """Should parse width even with extra viewport content."""
@@ -102,8 +104,9 @@ class TestRenderResolveViewport:
             '<html><head><meta name="viewport" content="width=800, initial-scale=1.0"></head><body></body></html>'
         )
 
-        result = render._resolve_viewport_width(str(html_file), opts)
-        assert result == 800
+        width, height = render._resolve_viewport_size(str(html_file), opts)
+        assert width == 800
+        assert height is None
 
     def test_returns_none_when_no_meta_tag(self, render, tmp_path):
         """Should return None when no viewport meta tag is found."""
@@ -113,10 +116,11 @@ class TestRenderResolveViewport:
         html_file = tmp_path / "test.html"
         html_file.write_text("<html><head></head><body></body></html>")
 
-        result = render._resolve_viewport_width(str(html_file), opts)
-        assert result is None
+        width, height = render._resolve_viewport_size(str(html_file), opts)
+        assert width is None
+        assert height is None
 
-    def test_returns_none_when_explicit_supersedes_meta(self, render, tmp_path):
+    def test_explicit_width_supersedes_meta(self, render, tmp_path):
         """Explicit viewport_width should be used even when meta tag exists."""
         from src.render import ScreenshotOptions
 
@@ -126,8 +130,9 @@ class TestRenderResolveViewport:
             '<html><head><meta name="viewport" content="width=600"></head><body></body></html>'
         )
 
-        result = render._resolve_viewport_width(str(html_file), opts)
-        assert result == 1200
+        width, height = render._resolve_viewport_size(str(html_file), opts)
+        assert width == 1200
+        assert height is None
 
     def test_malformed_html_no_crash(self, render, tmp_path):
         """Should not crash on malformed HTML."""
@@ -137,16 +142,60 @@ class TestRenderResolveViewport:
         html_file = tmp_path / "test.html"
         html_file.write_text("not even html")
 
-        result = render._resolve_viewport_width(str(html_file), opts)
-        assert result is None
+        width, height = render._resolve_viewport_size(str(html_file), opts)
+        assert width is None
+        assert height is None
 
     def test_file_not_found_no_crash(self, render):
         """Should not crash when file does not exist."""
         from src.render import ScreenshotOptions
 
         opts = ScreenshotOptions()
-        result = render._resolve_viewport_width("/nonexistent/file.html", opts)
-        assert result is None
+        width, height = render._resolve_viewport_size("/nonexistent/file.html", opts)
+        assert width is None
+        assert height is None
+
+    def test_auto_detect_height_from_meta(self, render, tmp_path):
+        """Should parse height from meta viewport content."""
+        from src.render import ScreenshotOptions
+
+        opts = ScreenshotOptions()
+        html_file = tmp_path / "test.html"
+        html_file.write_text(
+            '<html><head><meta name="viewport" content="height=900"></head><body></body></html>'
+        )
+
+        width, height = render._resolve_viewport_size(str(html_file), opts)
+        assert width is None
+        assert height == 900
+
+    def test_auto_detect_both_dimensions(self, render, tmp_path):
+        """Should parse both width and height from meta viewport."""
+        from src.render import ScreenshotOptions
+
+        opts = ScreenshotOptions()
+        html_file = tmp_path / "test.html"
+        html_file.write_text(
+            '<html><head><meta name="viewport" content="width=640, height=480"></head><body></body></html>'
+        )
+
+        width, height = render._resolve_viewport_size(str(html_file), opts)
+        assert width == 640
+        assert height == 480
+
+    def test_explicit_both_skips_meta_parsing(self, render, tmp_path):
+        """When both dimensions are explicit, skip meta parsing entirely."""
+        from src.render import ScreenshotOptions
+
+        opts = ScreenshotOptions(viewport_width=1920, viewport_height=1080)
+        html_file = tmp_path / "test.html"
+        html_file.write_text(
+            '<html><head><meta name="viewport" content="width=640, height=480"></head><body></body></html>'
+        )
+
+        width, height = render._resolve_viewport_size(str(html_file), opts)
+        assert width == 1920
+        assert height == 1080
 
 
 class TestRenderFromHtml:
