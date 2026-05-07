@@ -38,17 +38,7 @@ class GenerateRequest(BaseModel):
     as_json: bool = Field(default=False, alias="json")
 
 
-# ── Background S3 upload helpers ────────────────────────────────────
-
-async def _bg_upload_file(pic_path: str, object_key: str, media_type: str) -> None:
-    """Background upload from file path.  Used by json=false path."""
-    ok = await storage_service.aio_upload(pic_path, object_key, media_type)
-    if not ok:
-        logger.error(
-            "Background S3 upload FAILED: {} → {}.  Cached in Redis (TTL {:d}s).",
-            pic_path, object_key, get_image_lifetime(),
-        )
-
+# ── Background S3 upload helper ────────────────────────────────────
 
 async def _bg_put_bytes(object_key: str, data: bytes, media_type: str) -> None:
     """Background upload from bytes.  Used by json=true path (zero-file)."""
@@ -183,8 +173,9 @@ async def text2img(request: GenerateRequest):
             await cache.set(object_key, image_bytes, ttl=get_image_lifetime())
 
             bg = BackgroundTasks()
+            # Upload from bytes we already have in memory — no file race.
+            bg.add_task(_bg_put_bytes, object_key, image_bytes, media_type)
             bg.add_task(os.remove, pic_path)
-            asyncio.create_task(_bg_upload_file(pic_path, object_key, media_type))
 
             return FileResponse(pic_path, media_type=media_type, background=bg)
 
