@@ -146,10 +146,61 @@ spec:
                 secretKeyRef:
                   name: minio-credentials
                   key: MINIO_ROOT_PASSWORD
+            - name: REDIS_URL
+              value: "redis://redis-service.astr-t2i-distributed:6379/0"
 
 ---
-
-# 6. NodePort Service to expose the App
+# 6. Redis Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: astr-t2i-distributed
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          args:
+            - redis-server
+            - --maxmemory
+            - $(REDIS_MAXMEMORY)
+            - --maxmemory-policy
+            - $(REDIS_MAXMEMORY_POLICY)
+            - --save
+            - ""
+          env:
+            - name: REDIS_MAXMEMORY
+              value: "512mb"
+            - name: REDIS_MAXMEMORY_POLICY
+              value: "volatile-ttl"
+          ports:
+            - containerPort: 6379
+---
+# 7. ClusterIP Service for Redis
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-service
+  namespace: astr-t2i-distributed
+spec:
+  type: ClusterIP
+  selector:
+    app: redis
+  ports:
+    - protocol: TCP
+      port: 6379
+      targetPort: 6379
+---
+# 8. NodePort Service to expose the App
 apiVersion: v1
 kind: Service
 metadata:

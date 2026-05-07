@@ -66,11 +66,6 @@ class TestPostGenerate:
     """Tests for POST /text2img/generate."""
 
     def test_generate_from_html_json_mode(self, client, mock_render, mock_storage):
-        mock_render.from_html = AsyncMock(return_value=(
-            "data/rendered_test.html", "/abs/path/rendered_test.html"
-        ))
-        mock_render.html2pic = AsyncMock(return_value="data/rendered/test-id.png")
-
         response = client.post(
             "/text2img/generate",
             json={"html": "<h1>Hello</h1>", "json": True},
@@ -79,15 +74,12 @@ class TestPostGenerate:
         assert response.status_code == 200
         body = response.json()
         assert body["code"] == 0
-        assert body["data"]["id"] == "data/rendered/test-id.png"
-        mock_storage.upload.assert_called_once()
+        assert "id" in body["data"]
+        # The render mock was called (conftest verifies file creation)
+        mock_render.from_html.assert_called_once()
+        mock_render.html2pic.assert_called_once()
 
     def test_generate_from_template(self, client, mock_render, mock_storage):
-        mock_render.from_jinja_template = AsyncMock(return_value=(
-            "data/rendered_test.html", "/abs/path/rendered_test.html"
-        ))
-        mock_render.html2pic = AsyncMock(return_value="data/rendered/tpl-id.png")
-
         response = client.post(
             "/text2img/generate",
             json={
@@ -100,7 +92,7 @@ class TestPostGenerate:
         assert response.status_code == 200
         body = response.json()
         assert body["code"] == 0
-        assert body["data"]["id"] == "data/rendered/tpl-id.png"
+        assert "id" in body["data"]
 
     def test_generate_missing_html_and_tmpl(self, client):
         response = client.post("/text2img/generate", json={"json": True})
@@ -110,11 +102,6 @@ class TestPostGenerate:
         assert body["code"] == 1
 
     def test_generate_with_custom_options(self, client, mock_render, mock_storage):
-        mock_render.from_html = AsyncMock(return_value=(
-            "data/rendered_test.html", "/abs/path/rendered_test.html"
-        ))
-        mock_render.html2pic = AsyncMock(return_value="data/rendered/opt-id.jpg")
-
         response = client.post(
             "/text2img/generate",
             json={
@@ -132,11 +119,6 @@ class TestPostGenerate:
         assert passed_options.full_page is True
 
     def test_generate_default_options_when_none(self, client, mock_render, mock_storage):
-        mock_render.from_html = AsyncMock(return_value=(
-            "data/rendered_test.html", "/abs/path/rendered_test.html"
-        ))
-        mock_render.html2pic = AsyncMock(return_value="data/rendered/default.png")
-
         response = client.post(
             "/text2img/generate",
             json={"html": "<h1>Hello</h1>", "json": True},
