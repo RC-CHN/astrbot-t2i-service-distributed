@@ -126,7 +126,7 @@ spec:
     spec:
       containers:
         - name: text2img-app
-          image: rc0x01/astrbot-t2i-service-distributed:latest # Your image on Docker Hub
+          image: ghcr.io/rc-chn/astrbot-t2i-service-distributed:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8999

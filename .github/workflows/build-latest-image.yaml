@@ -1,4 +1,4 @@
-name: Release Docker Image
+name: Test & Release
 
 on:
   push:
@@ -8,8 +8,14 @@ on:
       - 'Dockerfile'
       - 'docker-compose.yml'
       - 'src/**'
-      - '.github/workflows/build-latest-image.yaml'
       - 'main.py'
+      - 'requirements.txt'
+      - 'pyproject.toml'
+      - 'tests/**'
+      - '.github/workflows/*.yaml'
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 env:
@@ -17,15 +23,58 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout
-      uses: actions/checkout@v2
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Login to Registry
-      run: docker login --username=${{ secrets.DOCKER_HUB_USERNAME }} --password ${{ secrets.DOCKER_HUB_PASSWORD }}
-    - name: Create Buildx
-      run: docker buildx create --name mybuilder --use
-    - name: Build
-      run: docker buildx build --platform linux/arm64,linux/amd64 -t soulter/astrbot-t2i-service:latest . --push
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt httpx pytest
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
+  build:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
