@@ -242,9 +242,17 @@ class Text2ImgRender:
             logger.info(f"html2pic: set viewport size to {width}x{height}")
 
         try:
-            await page.goto(
-                f"file://{html_file_path}", timeout=screenshot_options.timeout
-            )
+            # Use set_content instead of goto(file://) to avoid the
+            # file:// protocol CSP restrictions that block external CDN
+            # requests (marked.js, katex, etc.), which would cause blank
+            # images when those scripts don't execute.
+            with open(html_file_path, "r", encoding="utf-8") as f:
+                html_content = f.read()
+            await page.set_content(html_content)
+            # Wait for network-idle so CDN resources (marked.js, katex, etc.)
+            # are fully loaded before taking the screenshot.
+            # 5-second timeout as safety net; healthy CDNs resolve within 1-2s.
+            await page.wait_for_load_state("networkidle", timeout=5000)
             screenshot_kwargs = screenshot_options.model_dump(exclude_none=True)
             screenshot_kwargs.pop("viewport_width", None)
             screenshot_kwargs.pop("viewport_height", None)
