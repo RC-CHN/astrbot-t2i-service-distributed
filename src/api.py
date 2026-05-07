@@ -29,9 +29,10 @@ async def text2img_image(image_path: str):
     从对象存储获取图片并流式返回给客户端。
     """
     try:
-        # The full path is /text2img/data/{image_path}, where image_path is "data/rendered/..."
-        # We need to construct the full object key from the path parameter.
-        object_key = f"data/{image_path}"
+        # Normalize: strip leading "data/" if the caller already included it,
+        # then prepend "data/" to form the canonical object key.
+        normalized_path = image_path.removeprefix("data/")
+        object_key = f"data/{normalized_path}"
         stream = storage_service.download_stream(object_key)
         if stream:
             # 根据路径推断 media_type
@@ -58,6 +59,7 @@ async def text2img(request: GenerateRequest):
     """
     is_json_return = request.as_json or False
     html_file_path = None
+    abs_path = None
     pic_path = None
 
     try:
