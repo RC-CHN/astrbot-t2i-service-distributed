@@ -76,7 +76,7 @@ class TestRenderResolveViewport:
         html_file = tmp_path / "test.html"
         html_file.write_text("<html><head></head><body></body></html>")
 
-        width, height = render._resolve_viewport_size(str(html_file), opts)
+        width, height = render._resolve_viewport_size(html_file.read_text(), opts)
         assert width == 1024
         assert height is None
 
@@ -90,7 +90,7 @@ class TestRenderResolveViewport:
             '<html><head><meta name="viewport" content="width=600"></head><body></body></html>'
         )
 
-        width, height = render._resolve_viewport_size(str(html_file), opts)
+        width, height = render._resolve_viewport_size(html_file.read_text(), opts)
         assert width == 600
         assert height is None
 
@@ -104,7 +104,7 @@ class TestRenderResolveViewport:
             '<html><head><meta name="viewport" content="width=800, initial-scale=1.0"></head><body></body></html>'
         )
 
-        width, height = render._resolve_viewport_size(str(html_file), opts)
+        width, height = render._resolve_viewport_size(html_file.read_text(), opts)
         assert width == 800
         assert height is None
 
@@ -116,7 +116,7 @@ class TestRenderResolveViewport:
         html_file = tmp_path / "test.html"
         html_file.write_text("<html><head></head><body></body></html>")
 
-        width, height = render._resolve_viewport_size(str(html_file), opts)
+        width, height = render._resolve_viewport_size(html_file.read_text(), opts)
         assert width is None
         assert height is None
 
@@ -130,7 +130,7 @@ class TestRenderResolveViewport:
             '<html><head><meta name="viewport" content="width=600"></head><body></body></html>'
         )
 
-        width, height = render._resolve_viewport_size(str(html_file), opts)
+        width, height = render._resolve_viewport_size(html_file.read_text(), opts)
         assert width == 1200
         assert height is None
 
@@ -142,7 +142,7 @@ class TestRenderResolveViewport:
         html_file = tmp_path / "test.html"
         html_file.write_text("not even html")
 
-        width, height = render._resolve_viewport_size(str(html_file), opts)
+        width, height = render._resolve_viewport_size(html_file.read_text(), opts)
         assert width is None
         assert height is None
 
@@ -151,7 +151,7 @@ class TestRenderResolveViewport:
         from src.render import ScreenshotOptions
 
         opts = ScreenshotOptions()
-        width, height = render._resolve_viewport_size("/nonexistent/file.html", opts)
+        width, height = render._resolve_viewport_size("", opts)
         assert width is None
         assert height is None
 
@@ -165,7 +165,7 @@ class TestRenderResolveViewport:
             '<html><head><meta name="viewport" content="height=900"></head><body></body></html>'
         )
 
-        width, height = render._resolve_viewport_size(str(html_file), opts)
+        width, height = render._resolve_viewport_size(html_file.read_text(), opts)
         assert width is None
         assert height == 900
 
@@ -179,7 +179,7 @@ class TestRenderResolveViewport:
             '<html><head><meta name="viewport" content="width=640, height=480"></head><body></body></html>'
         )
 
-        width, height = render._resolve_viewport_size(str(html_file), opts)
+        width, height = render._resolve_viewport_size(html_file.read_text(), opts)
         assert width == 640
         assert height == 480
 
@@ -193,7 +193,7 @@ class TestRenderResolveViewport:
             '<html><head><meta name="viewport" content="width=640, height=480"></head><body></body></html>'
         )
 
-        width, height = render._resolve_viewport_size(str(html_file), opts)
+        width, height = render._resolve_viewport_size(html_file.read_text(), opts)
         assert width == 1920
         assert height == 1080
 

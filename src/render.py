@@ -122,6 +122,16 @@ class Text2ImgRender:
         html = env.from_string(template).render(data)
         return await self.from_html(html)
 
+    def render_template(self, template: str, data: dict) -> str:
+        """Render Jinja2 template to HTML string.  Zero file I/O.
+
+        Unlike from_jinja_template(), this does NOT write to disk —
+        it returns the raw HTML string suitable for use with
+        html2pic_bytes() / html2pic_file().
+        """
+        env = SandboxedEnvironment()
+        return env.from_string(template).render(data)
+
     async def from_html(self, html: str) -> tuple[str, str]:
         html_file_path, abs_path = generate_data_path(
             suffix="html", namespace="rendered"
@@ -130,19 +140,16 @@ class Text2ImgRender:
             f.write(html)
         return html_file_path, abs_path
 
+    @staticmethod
     def _resolve_viewport_size(
-            self, html_file_path: str, screenshot_options: ScreenshotOptions
+        html_content: str, screenshot_options: ScreenshotOptions
     ) -> tuple[int | None, int | None]:
-        """根据截图参数与 HTML 内容推断 viewport 大小（宽, 高）。
+        """根据 HTML 内容（字符串）推断 viewport 大小（宽, 高）。
 
         优先级：
         1. 调用方在 ScreenshotOptions 中显式指定 `viewport_width` / `viewport_height`；
         2. 从 HTML 中的 `<meta name="viewport" content="width=...; height=...">` 自动解析；
         3. 未能解析到时返回对应的 None（调用方可选择使用 Playwright 默认值）。
-
-        将逻辑集中到独立方法，便于后续扩展：
-        - 支持更多 meta 语法 / 自定义 data-* 属性；
-        - 支持从额外配置源中读取默认宽度等。
         """
 
         viewport_width: int | None = screenshot_options.viewport_width
@@ -152,10 +159,9 @@ class Text2ImgRender:
         if viewport_width is not None and viewport_height is not None:
             return viewport_width, viewport_height
 
-        # 未指定时，尝试从 HTML meta 中解析（只读前几 KB 即可命中 <head> 区域）
+        # 未指定时，尝试从 HTML meta 中解析（只读前 4KB 即可命中 <head> 区域）
         try:
-            with open(html_file_path, "r", encoding="utf-8") as f:
-                head_snippet = f.read(4096)
+            head_snippet = html_content[:4096]
 
             # 尝试解析宽度和高度（允许任意顺序出现在 content 中）
             if viewport_width is None:
@@ -173,7 +179,7 @@ class Text2ImgRender:
                 )
                 if m := re.search(pattern, head_snippet, re.IGNORECASE):
                     viewport_height = int(m[1])
-        except (OSError, UnicodeDecodeError, re.error, ValueError) as e:
+        except (re.error, ValueError) as e:
             logger.debug(f"Adjust viewport from meta tag failed: {e}")
 
         return viewport_width, viewport_height
@@ -219,7 +225,6 @@ class Text2ImgRender:
             logger.warning(
                 f"html2pic: Failed to create new page, restarting browser context: {e}"
             )
-            # Close and remove the specific context, then recreate it
             if level in self.contexts:
                 try:
                     await self.contexts[level].close()
@@ -229,44 +234,126 @@ class Text2ImgRender:
             context = await self._ensure_context(level)
             page = await context.new_page()
 
-        viewport_width, viewport_height = self._resolve_viewport_size(
-            html_file_path, screenshot_options
-        )
+        try:
+            # Read HTML content once — used for both viewport detection
+            # and page.set_content() (zero extra I/O).
+            with open(html_file_path, "r", encoding="utf-8") as f:
+                html_content = f.read()
+        except Exception as e:
+            await page.close()
+            raise
 
-        width = viewport_width if viewport_width is not None else 800
-        height = viewport_height if viewport_height is not None else 720
-        # Set viewport size if either width or height is specified
-        if viewport_width is not None and viewport_height is not None:
-            # Default values if one dimension not specified
+        vp_w, vp_h = self._resolve_viewport_size(html_content, screenshot_options)
+        width = vp_w if vp_w is not None else 800
+        height = vp_h if vp_h is not None else 720
+        if vp_w is not None or vp_h is not None:
             await page.set_viewport_size({"width": width, "height": height})
             logger.info(f"html2pic: set viewport size to {width}x{height}")
 
         try:
-            # Use set_content instead of goto(file://) to avoid the
-            # file:// protocol CSP restrictions that block external CDN
-            # requests (marked.js, katex, etc.), which would cause blank
-            # images when those scripts don't execute.
-            with open(html_file_path, "r", encoding="utf-8") as f:
-                html_content = f.read()
             await page.set_content(html_content)
-            # Wait for network-idle so CDN resources (marked.js, katex, etc.)
-            # are fully loaded before taking the screenshot.
-            # 5-second timeout as safety net; healthy CDNs resolve within 1-2s.
             await page.wait_for_load_state("networkidle", timeout=5000)
-            screenshot_kwargs = screenshot_options.model_dump(exclude_none=True)
-            screenshot_kwargs.pop("viewport_width", None)
-            screenshot_kwargs.pop("viewport_height", None)
-            screenshot_kwargs.pop("device_scale_factor_level", None)
-
-            # Robustness: Remove quality if type is png, as Playwright errors out
-            if screenshot_options.type == "png":
-                screenshot_kwargs.pop("quality", None)
-
+            screenshot_kwargs = self._screenshot_kwargs(screenshot_options)
             await page.screenshot(path=result_path, **screenshot_kwargs)
         finally:
-            # Ensure the page is closed to free resources
             await page.close()
 
         logger.info(f"Rendered {html_file_path} to {result_path}")
-
         return result_path
+
+    # ── Zero-file-I/O render (for json=true path) ─────────────────────
+
+    async def html2pic_bytes(
+        self, html_content: str, screenshot_options: ScreenshotOptions
+    ) -> bytes:
+        """Render HTML string directly to image bytes.  Zero disk I/O.
+
+        Caller receives the raw bytes and handles caching/upload itself.
+        """
+        level = screenshot_options.device_scale_factor_level or "normal"
+        context = await self._ensure_context(level)
+
+        try:
+            page = await context.new_page()
+        except TargetClosedError as e:
+            logger.warning(f"html2pic_bytes: restarting browser context: {e}")
+            if level in self.contexts:
+                try:
+                    await self.contexts[level].close()
+                except Exception:
+                    pass
+                del self.contexts[level]
+            context = await self._ensure_context(level)
+            page = await context.new_page()
+
+        vp_w, vp_h = self._resolve_viewport_size(html_content, screenshot_options)
+        width = vp_w if vp_w is not None else 800
+        height = vp_h if vp_h is not None else 720
+        if vp_w is not None or vp_h is not None:
+            await page.set_viewport_size({"width": width, "height": height})
+            logger.info(f"html2pic_bytes: viewport {width}x{height}")
+
+        try:
+            await page.set_content(html_content)
+            await page.wait_for_load_state("networkidle", timeout=5000)
+            screenshot_kwargs = self._screenshot_kwargs(screenshot_options)
+            return await page.screenshot(**screenshot_kwargs)
+        finally:
+            await page.close()
+
+    # ── File render from HTML string (for json=false path) ────────────
+
+    async def html2pic_file(
+        self, html_content: str, screenshot_options: ScreenshotOptions
+    ) -> str:
+        """Render HTML string to a file on disk.  Returns the file path.
+
+        Used when a physical file is required (e.g. FileResponse).
+        """
+        level = screenshot_options.device_scale_factor_level or "normal"
+        context = await self._ensure_context(level)
+
+        suffix = screenshot_options.type if screenshot_options.type else "png"
+        result_path, _ = generate_data_path(suffix=suffix, namespace="rendered")
+
+        try:
+            page = await context.new_page()
+        except TargetClosedError as e:
+            logger.warning(f"html2pic_file: restarting browser context: {e}")
+            if level in self.contexts:
+                try:
+                    await self.contexts[level].close()
+                except Exception:
+                    pass
+                del self.contexts[level]
+            context = await self._ensure_context(level)
+            page = await context.new_page()
+
+        vp_w, vp_h = self._resolve_viewport_size(html_content, screenshot_options)
+        width = vp_w if vp_w is not None else 800
+        height = vp_h if vp_h is not None else 720
+        if vp_w is not None or vp_h is not None:
+            await page.set_viewport_size({"width": width, "height": height})
+            logger.info(f"html2pic_file: viewport {width}x{height}")
+
+        try:
+            await page.set_content(html_content)
+            await page.wait_for_load_state("networkidle", timeout=5000)
+            screenshot_kwargs = self._screenshot_kwargs(screenshot_options)
+            await page.screenshot(path=result_path, **screenshot_kwargs)
+        finally:
+            await page.close()
+
+        logger.info(f"Rendered to {result_path}")
+        return result_path
+
+    @staticmethod
+    def _screenshot_kwargs(opts: ScreenshotOptions) -> dict:
+        """Build playwright screenshot kwargs from ScreenshotOptions."""
+        kwargs = opts.model_dump(exclude_none=True)
+        kwargs.pop("viewport_width", None)
+        kwargs.pop("viewport_height", None)
+        kwargs.pop("device_scale_factor_level", None)
+        if opts.type == "png":
+            kwargs.pop("quality", None)
+        return kwargs

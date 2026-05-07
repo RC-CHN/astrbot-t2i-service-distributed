@@ -109,5 +109,43 @@ class StorageService:
                         return False
         return False
 
+    # ── Zero-file-I/O bytes upload ────────────────────────────────────
+
+    async def aio_put_bytes(
+        self, key: str, data: bytes, content_type: str = "image/png"
+    ) -> bool:
+        """Upload raw bytes directly to S3.  Zero file I/O.
+
+        Same semaphore + retry guarantees as aio_upload().
+        """
+        async with _UPLOAD_SEMAPHORE:
+            for attempt in range(1, _UPLOAD_RETRIES + 1):
+                try:
+                    await asyncio.to_thread(
+                        self.client.put_object,
+                        Bucket=self.bucket_name,
+                        Key=key,
+                        Body=data,
+                        ContentType=content_type,
+                        ACL="public-read",
+                    )
+                    logger.info("Put %d bytes → %s (attempt %d)", len(data), key, attempt)
+                    return True
+                except Exception as e:
+                    delay = 2 ** (attempt - 1)
+                    logger.warning(
+                        "Put bytes failed %s (attempt %d/%d): %s.  Retry in %ds...",
+                        key, attempt, _UPLOAD_RETRIES, e, delay,
+                    )
+                    if attempt < _UPLOAD_RETRIES:
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error(
+                            "Put bytes FAILED after %d retries: %s: %s",
+                            _UPLOAD_RETRIES, key, e,
+                        )
+                        return False
+        return False
+
 
 storage_service = StorageService()

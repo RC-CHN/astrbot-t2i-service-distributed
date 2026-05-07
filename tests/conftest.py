@@ -40,17 +40,22 @@ def mock_storage():
     mock = MagicMock()
     mock.download_stream = MagicMock(return_value=None)
     mock.aio_upload = AsyncMock(return_value=True)
+    mock.aio_put_bytes = AsyncMock(return_value=True)
     return mock
 
 
 def _make_fake_render():
     """Return a mock render engine that creates actual temp files.
 
-    The POST handler now reads rendered images back from disk (for Redis
-    caching), so the paths returned by html2pic / from_html must point to
-    real files.
+    The POST handler now uses html2pic_bytes (zero-file, returns bytes)
+    or html2pic_file (returns file path), depending on json=true/false.
     """
     mock = MagicMock()
+
+    # render_template: input template string → output HTML string
+    mock.render_template = MagicMock(
+        side_effect=lambda tmpl, data: f"<html><body>{data.get('body', data)}</body></html>"
+    )
 
     async def _from_html(html: str):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".html", delete=False) as f:
@@ -63,14 +68,22 @@ def _make_fake_render():
         html = SandboxedEnvironment().from_string(tmpl).render(data)
         return await _from_html(html)
 
-    async def _html2pic(html_path: str, options):
+    async def _html2pic_bytes(html_str: str, options):
+        return b"\x89PNG\r\n\x1a\nfake-bytes"
+
+    async def _html2pic_file(html_str: str, options):
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-            f.write(b"\x89PNG\r\n\x1a\nfake")
+            f.write(b"\x89PNG\r\n\x1a\nfake-file")
             return f.name
+
+    async def _html2pic(html_file_path: str, options):
+        return (await _html2pic_file("", options))
 
     mock.from_html = AsyncMock(side_effect=_from_html)
     mock.from_jinja_template = AsyncMock(side_effect=_from_jinja)
     mock.html2pic = AsyncMock(side_effect=_html2pic)
+    mock.html2pic_bytes = AsyncMock(side_effect=_html2pic_bytes)
+    mock.html2pic_file = AsyncMock(side_effect=_html2pic_file)
     return mock
 
 

@@ -75,9 +75,7 @@ class TestPostGenerate:
         body = response.json()
         assert body["code"] == 0
         assert "id" in body["data"]
-        # The render mock was called (conftest verifies file creation)
-        mock_render.from_html.assert_called_once()
-        mock_render.html2pic.assert_called_once()
+        mock_render.html2pic_bytes.assert_called_once()
 
     def test_generate_from_template(self, client, mock_render, mock_storage):
         response = client.post(
@@ -96,10 +94,8 @@ class TestPostGenerate:
 
     def test_generate_missing_html_and_tmpl(self, client):
         response = client.post("/text2img/generate", json={"json": True})
-
         assert response.status_code == 400
-        body = response.json()
-        assert body["code"] == 1
+        assert response.json()["code"] == 1
 
     def test_generate_with_custom_options(self, client, mock_render, mock_storage):
         response = client.post(
@@ -112,7 +108,7 @@ class TestPostGenerate:
         )
 
         assert response.status_code == 200
-        call_args = mock_render.html2pic.call_args
+        call_args = mock_render.html2pic_bytes.call_args
         passed_options = call_args[0][1]
         assert passed_options.type == "jpeg"
         assert passed_options.quality == 85
@@ -125,14 +121,14 @@ class TestPostGenerate:
         )
 
         assert response.status_code == 200
-        call_args = mock_render.html2pic.call_args
+        call_args = mock_render.html2pic_bytes.call_args
         passed_options = call_args[0][1]
         assert passed_options.type == "png"
         assert passed_options.full_page is True
         assert passed_options.scale == "device"
 
     def test_generate_handles_render_error(self, client, mock_render):
-        mock_render.from_html = AsyncMock(side_effect=ValueError("Something broke"))
+        mock_render.html2pic_bytes = AsyncMock(side_effect=ValueError("Boom"))
 
         response = client.post(
             "/text2img/generate",
@@ -140,5 +136,4 @@ class TestPostGenerate:
         )
 
         assert response.status_code == 500
-        body = response.json()
-        assert body["code"] == 1
+        assert response.json()["code"] == 1
