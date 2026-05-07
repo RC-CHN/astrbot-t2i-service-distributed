@@ -214,4 +214,20 @@ spec:
     - protocol: TCP
       port: 8999
       targetPort: 8999
-      # nodePort: 30007 # You can optionally specify a port, otherwise K8s will assign one.
+      # nodePort: 30007 # You can optionally specify a port, otherwise K8s will assign one
+
+---
+# 9. LoadBalancer Service (MetalLB) to expose the App
+apiVersion: v1
+kind: Service
+metadata:
+  name: text2img-lb
+  namespace: astr-t2i-distributed
+spec:
+  type: LoadBalancer
+  selector:
+    app: text2img
+  ports:
+    - protocol: TCP
+      port: 8999
+      targetPort: 8999
