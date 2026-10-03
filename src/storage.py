@@ -1,151 +1,114 @@
+"""Lazy, retryable S3 access: an unavailable MinIO must not crash a worker."""
 import asyncio
-import boto3
 import logging
+import time
+
+import boto3
 from botocore.client import Config
 from botocore.exceptions import ClientError
+
 from .config import settings
+from .concurrency import complete_before_cancel
 
 logger = logging.getLogger(__name__)
 
-# Limit concurrent S3 uploads to avoid saturating the endpoint
-# and to bound memory usage from background upload tasks.
-_UPLOAD_SEMAPHORE = asyncio.Semaphore(20)
-_UPLOAD_RETRIES = 3
-
 
 class StorageService:
-    """S3-compatible storage service with async-safe upload."""
-
     def __init__(self):
-        try:
-            self.client = boto3.client(
-                "s3",
-                endpoint_url=settings.S3_ENDPOINT_URL,
-                aws_access_key_id=settings.S3_ACCESS_KEY_ID,
-                aws_secret_access_key=settings.S3_SECRET_ACCESS_KEY,
-                config=Config(
-                    signature_version="s3v4",
-                    region_name="us-east-1",
-                    s3={"addressing_style": "path"},
-                    max_pool_connections=50,
-                ),
-            )
-            self.bucket_name = settings.S3_BUCKET_NAME
-            logger.info("Connected to S3: %s", settings.S3_ENDPOINT_URL)
-            self._ensure_bucket_exists()
-        except Exception as e:
-            logger.error("S3 connection failed: %s", e)
-            raise
+        # Client construction does no network I/O with explicit credentials.
+        self.client = boto3.client(
+            "s3", endpoint_url=settings.S3_ENDPOINT_URL,
+            aws_access_key_id=settings.S3_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.S3_SECRET_ACCESS_KEY,
+            config=Config(
+                signature_version="s3v4", region_name="us-east-1",
+                s3={"addressing_style": "path"},
+                max_pool_connections=settings.S3_UPLOAD_CONCURRENCY + 4,
+                connect_timeout=settings.S3_CONNECT_TIMEOUT,
+                read_timeout=settings.S3_READ_TIMEOUT,
+                retries={"total_max_attempts": 2, "mode": "standard"},
+            ),
+        )
+        self.bucket_name = settings.S3_BUCKET_NAME
+        self.ready = False
+        self._next_check = 0.0
+        self._check_lock = asyncio.Lock()
+        self._uploads = asyncio.Semaphore(settings.S3_UPLOAD_CONCURRENCY)
 
     def _ensure_bucket_exists(self):
         try:
             self.client.head_bucket(Bucket=self.bucket_name)
-            logger.info("Bucket '%s' exists.", self.bucket_name)
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "404":
-                try:
-                    self.client.create_bucket(Bucket=self.bucket_name)
-                    logger.info("Created bucket '%s'.", self.bucket_name)
-                except ClientError as create_error:
-                    logger.error("Create bucket '%s' failed: %s", self.bucket_name, create_error)
-                    raise
-            else:
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] not in {"404", "NoSuchBucket", "NotFound"}:
                 raise
+            try:
+                self.client.create_bucket(Bucket=self.bucket_name)
+            except ClientError as create_exc:
+                # Another replica may create the bucket between HEAD and CREATE.
+                if create_exc.response["Error"]["Code"] != "BucketAlreadyOwnedByYou":
+                    raise
 
-    # ── Sync (legacy, kept for internal use) ────────────────────────
+    async def ensure_ready(self, force=False):
+        if self.ready and not force:
+            return True
+        if time.monotonic() < self._next_check:
+            return self.ready
+        async with self._check_lock:
+            if self.ready and not force:
+                return True
+            if time.monotonic() < self._next_check:
+                return self.ready
+            try:
+                await asyncio.to_thread(self._ensure_bucket_exists)
+                self.ready = True
+                self._next_check = time.monotonic() + settings.S3_RETRY_INTERVAL
+                logger.info("S3 bucket is available")
+            except Exception as exc:
+                self.ready = False
+                self._next_check = time.monotonic() + settings.S3_RETRY_INTERVAL
+                logger.warning("S3 unavailable; worker stays live and will retry: %s", exc)
+            return self.ready
 
     def upload(self, file_path: str, object_name: str, content_type: str = "image/png"):
-        self.client.upload_file(
-            file_path,
-            self.bucket_name,
-            object_name,
-            ExtraArgs={"ContentType": content_type, "ACL": "public-read"},
-        )
-        logger.info("Uploaded %s → %s", file_path, object_name)
+        self.client.upload_file(file_path, self.bucket_name, object_name,
+                                ExtraArgs={"ContentType": content_type, "ACL": "public-read"})
 
     def download_stream(self, object_name: str):
         try:
-            response = self.client.get_object(Bucket=self.bucket_name, Key=object_name)
-            logger.info("Streaming download: %s", object_name)
-            return response["Body"]
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "NoSuchKey":
-                logger.warning("Key not found: %s", object_name)
+            return self.client.get_object(Bucket=self.bucket_name, Key=object_name)["Body"]
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] in {"NoSuchKey", "404"}:
                 return None
             raise
 
-    # ── Async upload (non-blocking, with retry + semaphore) ────────
+    async def _upload(self, operation, *args, **kwargs):
+        # Requests retain admission until upload completes; there is no unbounded
+        # population of background tasks retaining image bytes behind this semaphore.
+        async with self._uploads:
+            if not await self.ensure_ready():
+                return False
+
+            async def transfer():
+                try:
+                    await asyncio.to_thread(operation, *args, **kwargs)
+                    return True
+                except Exception as exc:
+                    self.ready = False
+                    self._next_check = time.monotonic() + settings.S3_RETRY_INTERVAL
+                    logger.warning("S3 upload failed; bucket check will retry: %s", exc)
+                    return False
+
+            return await complete_before_cancel(transfer())
 
     async def aio_upload(self, file_path: str, object_name: str, content_type: str = "image/png") -> bool:
-        """Upload to S3 in a thread pool, with concurrency limit and retries.
+        return await self._upload(self.upload, file_path, object_name, content_type)
 
-        Returns True on success, False after exhausting retries.
-        """
-        async with _UPLOAD_SEMAPHORE:
-            for attempt in range(1, _UPLOAD_RETRIES + 1):
-                try:
-                    await asyncio.to_thread(
-                        self.client.upload_file,
-                        file_path,
-                        self.bucket_name,
-                        object_name,
-                        ExtraArgs={"ContentType": content_type, "ACL": "public-read"},
-                    )
-                    logger.info("Uploaded %s → %s (attempt %d)", file_path, object_name, attempt)
-                    return True
-                except Exception as e:
-                    delay = 2 ** (attempt - 1)  # 1s, 2s, 4s
-                    logger.warning(
-                        "Upload failed %s → %s (attempt %d/%d): %s.  Retry in %ds...",
-                        file_path, object_name, attempt, _UPLOAD_RETRIES, e, delay,
-                    )
-                    if attempt < _UPLOAD_RETRIES:
-                        await asyncio.sleep(delay)
-                    else:
-                        logger.error(
-                            "Upload FAILED after %d retries: %s → %s: %s",
-                            _UPLOAD_RETRIES, file_path, object_name, e,
-                        )
-                        return False
-        return False
+    async def aio_put_bytes(self, key: str, data: bytes, content_type: str = "image/png") -> bool:
+        return await self._upload(self.client.put_object, Bucket=self.bucket_name,
+                                  Key=key, Body=data, ContentType=content_type, ACL="public-read")
 
-    # ── Zero-file-I/O bytes upload ────────────────────────────────────
-
-    async def aio_put_bytes(
-        self, key: str, data: bytes, content_type: str = "image/png"
-    ) -> bool:
-        """Upload raw bytes directly to S3.  Zero file I/O.
-
-        Same semaphore + retry guarantees as aio_upload().
-        """
-        async with _UPLOAD_SEMAPHORE:
-            for attempt in range(1, _UPLOAD_RETRIES + 1):
-                try:
-                    await asyncio.to_thread(
-                        self.client.put_object,
-                        Bucket=self.bucket_name,
-                        Key=key,
-                        Body=data,
-                        ContentType=content_type,
-                        ACL="public-read",
-                    )
-                    logger.info("Put %d bytes → %s (attempt %d)", len(data), key, attempt)
-                    return True
-                except Exception as e:
-                    delay = 2 ** (attempt - 1)
-                    logger.warning(
-                        "Put bytes failed %s (attempt %d/%d): %s.  Retry in %ds...",
-                        key, attempt, _UPLOAD_RETRIES, e, delay,
-                    )
-                    if attempt < _UPLOAD_RETRIES:
-                        await asyncio.sleep(delay)
-                    else:
-                        logger.error(
-                            "Put bytes FAILED after %d retries: %s: %s",
-                            _UPLOAD_RETRIES, key, e,
-                        )
-                        return False
-        return False
+    async def close(self):
+        await asyncio.to_thread(self.client.close)
 
 
 storage_service = StorageService()

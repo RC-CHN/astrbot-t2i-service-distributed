@@ -5,6 +5,8 @@ any real network connections.
 """
 
 import pytest
+import asyncio
+import threading
 from unittest.mock import MagicMock
 from botocore.exceptions import ClientError
 
@@ -44,8 +46,10 @@ class TestStorageServiceInit:
         assert call_kwargs["aws_access_key_id"] == settings.S3_ACCESS_KEY_ID
         assert call_kwargs["aws_secret_access_key"] == settings.S3_SECRET_ACCESS_KEY
 
-    def test_init_checks_bucket_exists(self):
+    def test_init_does_not_contact_storage(self):
         svc = _make_service()
+        svc.client.head_bucket.assert_not_called()
+        assert asyncio.run(svc.ensure_ready())
         svc.client.head_bucket.assert_called_once_with(Bucket="text2img")
 
     def test_bucket_created_when_not_found(self):
@@ -56,10 +60,11 @@ class TestStorageServiceInit:
 
         import src.storage as _storage
 
-        _storage.StorageService()
+        svc = _storage.StorageService()
+        assert asyncio.run(svc.ensure_ready())
         mock.create_bucket.assert_called_once_with(Bucket="text2img")
 
-    def test_init_raises_on_bucket_error(self):
+    def test_forbidden_bucket_does_not_crash_worker(self):
         mock = _new_mock_client()
         mock.head_bucket.side_effect = ClientError(
             {"Error": {"Code": "403", "Message": "Forbidden"}}, "HeadBucket"
@@ -67,8 +72,9 @@ class TestStorageServiceInit:
 
         import src.storage as _storage
 
-        with pytest.raises(ClientError):
-            _storage.StorageService()
+        svc = _storage.StorageService()
+        assert asyncio.run(svc.ensure_ready()) is False
+        assert svc.ready is False
 
 
 class TestStorageServiceMethods:
@@ -113,3 +119,108 @@ class TestStorageServiceMethods:
 
         with pytest.raises(ClientError):
             svc.download_stream("secret.png")
+
+
+def test_offline_storage_recovers_without_restart():
+    from botocore.exceptions import EndpointConnectionError
+    svc = _make_service()
+    svc.client.head_bucket.side_effect = EndpointConnectionError(endpoint_url="http://offline")
+    async def scenario():
+        assert not await svc.ensure_ready()
+        assert not await svc.ensure_ready()  # cooldown prevents a request storm
+        assert svc.client.head_bucket.call_count == 1
+        svc.client.head_bucket.side_effect = None
+        svc._next_check = 0
+        assert await svc.ensure_ready()
+        assert await svc.aio_put_bytes("test.png", b"png")
+    asyncio.run(scenario())
+
+
+def test_concurrent_storage_initialization_is_serialized():
+    svc = _make_service()
+    async def scenario():
+        results = await asyncio.gather(*(svc.ensure_ready() for _ in range(20)))
+        assert all(results)
+        assert svc.client.head_bucket.call_count == 1
+    asyncio.run(scenario())
+
+
+def test_failed_upload_marks_storage_unavailable():
+    svc = _make_service()
+    svc.client.put_object.side_effect = RuntimeError("storage down")
+    async def scenario():
+        assert not await svc.aio_put_bytes("test.png", b"png")
+        assert not svc.ready
+    asyncio.run(scenario())
+
+
+def test_cancelled_upload_retains_slot_until_physical_thread_finishes():
+    svc = _make_service()
+    svc.ready = True
+    svc._uploads = asyncio.Semaphore(1)
+    release = threading.Event()
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        calls = []
+
+        def put_object(**kwargs):
+            calls.append(kwargs["Key"])
+            loop.call_soon_threadsafe(started.set)
+            if kwargs["Key"] == "first.png":
+                assert release.wait(5), "test did not release upload thread"
+
+        svc.client.put_object.side_effect = put_object
+        first = asyncio.create_task(svc.aio_put_bytes("first.png", b"first image"))
+        second = None
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            first.cancel()
+            await asyncio.sleep(0)
+            first.cancel()  # A second cancellation must not cancel the transfer.
+            second = asyncio.create_task(svc.aio_put_bytes("second.png", b"second image"))
+            await asyncio.sleep(0.02)
+            assert not first.done()
+            assert calls == ["first.png"]
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            assert await second
+            assert calls == ["first.png", "second.png"]
+        finally:
+            release.set()
+            await asyncio.gather(first, *([second] if second else []), return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_upload_failure_after_cancellation_still_marks_storage_unavailable():
+    svc = _make_service()
+    svc.ready = True
+    release = threading.Event()
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+
+        def put_object(**kwargs):
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(5), "test did not release upload thread"
+            raise RuntimeError("storage failed while caller was cancelled")
+
+        svc.client.put_object.side_effect = put_object
+        task = asyncio.create_task(svc.aio_put_bytes("first.png", b"first image"))
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            task.cancel()
+            await asyncio.sleep(0)
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not svc.ready
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())

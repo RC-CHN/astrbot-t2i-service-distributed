@@ -124,13 +124,61 @@ spec:
       labels:
         app: text2img
     spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 50
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: text2img
       containers:
         - name: text2img-app
           image: ghcr.io/rc-chn/astrbot-t2i-service-distributed:latest
           imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 3Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8999
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8999
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8999
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
           ports:
             - containerPort: 8999
           env:
+            - name: RENDER_CONCURRENCY
+              value: "2"
+            - name: RENDER_QUEUE_SIZE
+              value: "4"
             - name: S3_ENDPOINT_URL
               # Use the full internal DNS name for cross-namespace communication
               value: "http://minio-service.astr-t2i-distributed:9000"

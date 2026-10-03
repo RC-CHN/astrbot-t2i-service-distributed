@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
     paths:
       - 'Dockerfile'
       - 'docker-compose.yml'
@@ -11,12 +13,20 @@ on:
       - 'main.py'
       - 'requirements.txt'
       - 'pyproject.toml'
+      - 'uv.lock'
       - 'tests/**'
       - '.github/workflows/*.yaml'
   pull_request:
     branches:
       - main
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
@@ -25,6 +35,11 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.13']
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,21 +47,47 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Check release version
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from src import __version__
+          with open('pyproject.toml', 'rb') as stream:
+              version = tomllib.load(stream)['project']['version']
+          assert version == __version__, 'Package and API versions differ'
+          if os.environ['GITHUB_REF_TYPE'] == 'tag':
+              assert os.environ['GITHUB_REF_NAME'] == f'v{version}', 'Tag does not match package version'
+          PY
 
       - name: Install dependencies
-        run: pip install -r requirements.txt httpx pytest
+        run: pip install -r requirements.txt httpx==0.28.1 pytest==9.0.2
+
+      - name: Install Chromium and system dependencies
+        run: python -m playwright install --with-deps --only-shell chromium
 
       - name: Run tests
+        env:
+          RUN_BROWSER_TESTS: '1'
         run: python -m pytest tests/ -v
 
   build:
     needs: test
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -65,7 +106,9 @@ jobs:
           images: |
             ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value=latest
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=,format=short
 
       - name: Build and push

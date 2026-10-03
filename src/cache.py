@@ -1,87 +1,72 @@
-"""Redis-backed image cache for astrbot-t2i-service.
-
-Provides an async get/set interface over Redis.  The cache sits in front
-of S3/MinIO so that recently-generated images are served from memory
-without hitting object storage on every GET request.
-
-Resilience
-----------
-- Startup: non-fatal — worker starts even if Redis is down (cache degrades
-  to S3-only until Redis recovers).
-- Runtime: connection errors trigger an auto-reconnect attempt on the next
-  get/set call so the cache self-heals.
-"""
+"""Fail-open Redis cache with bounded operations and serialized reconnects."""
+import asyncio
+import time
 
 import redis.asyncio as aioredis
 from loguru import logger
-
 from .config import settings
 
 
 class RedisImageCache:
-    """Async Redis cache for rendered images.  Fail-open at all times."""
+    def __init__(self):
+        self._redis = None
+        self._lock = asyncio.Lock()
+        self._next_retry = 0.0
 
-    def __init__(self) -> None:
-        self._redis: aioredis.Redis | None = None
-
-    async def connect(self) -> None:
-        """Initialise Redis connection (non-fatal).
-
-        If Redis is unreachable the worker starts anyway; cache operations
-        silently degrade to S3-only and auto-reconnect when Redis returns.
-        """
-        try:
-            self._redis = aioredis.Redis.from_url(
-                settings.REDIS_URL,
-                decode_responses=False,
-                socket_connect_timeout=3,
-                socket_keepalive=True,
-                retry_on_timeout=True,
-                health_check_interval=30,
+    async def connect(self):
+        if self._redis is not None or time.monotonic() < self._next_retry:
+            return
+        async with self._lock:
+            if self._redis is not None or time.monotonic() < self._next_retry:
+                return
+            client = aioredis.Redis.from_url(
+                settings.REDIS_URL, decode_responses=False,
+                socket_connect_timeout=1, socket_timeout=1,
+                socket_keepalive=True, health_check_interval=30,
+                retry_on_timeout=False,
+                max_connections=(settings.RENDER_CONCURRENCY + settings.RENDER_QUEUE_SIZE
+                                 + settings.IMAGE_DOWNLOAD_CONCURRENCY + 4),
             )
-            await self._redis.ping()
-            logger.info("Redis cache connected: {}", settings.REDIS_URL)
-        except Exception as e:
-            logger.warning(
-                "Redis unavailable ({}).  Cache disabled — serving from S3 only.  "
-                "Will auto-reconnect on next cache operation.", e
-            )
-            self._redis = None
+            try:
+                await client.ping()
+                self._redis = client
+            except Exception as exc:
+                await client.aclose()
+                self._next_retry = time.monotonic() + 5
+                logger.warning("Redis unavailable; retrying later: {}", exc)
 
-    async def disconnect(self) -> None:
-        if self._redis:
-            await self._redis.aclose()
-            self._redis = None
+    async def disconnect(self):
+        client, self._redis = self._redis, None
+        if client is not None:
+            await client.aclose()
 
-    # ── fail-open helpers ─────────────────────────────────────────────
-
-    async def _ensure_connected(self) -> bool:
-        """Try to (re)connect if the client is missing.  Returns True if ready."""
-        if self._redis is not None:
-            return True
-        # Single-shot reconnect attempt
+    async def _operation(self, operation, *args, **kwargs):
         await self.connect()
+        client = self._redis
+        if client is None:
+            return None
+        try:
+            return await getattr(client, operation)(*args, **kwargs)
+        except Exception as exc:
+            if self._redis is client:
+                self._redis = None
+                self._next_retry = time.monotonic() + 5
+                await client.aclose()
+            logger.warning("Redis {} failed: {}", operation, exc)
+            return None
+
+    @property
+    def healthy(self):
         return self._redis is not None
 
-    async def get(self, key: str) -> bytes | None:
-        """Return cached image bytes, or None (cache miss / Redis down)."""
-        if not await self._ensure_connected():
-            return None
-        try:
-            return await self._redis.get(key)
-        except Exception as e:
-            logger.warning("Redis get failed ({}).  Disconnecting.", e)
-            self._redis = None
-            return None
+    async def check(self):
+        return bool(await self._operation("ping"))
 
-    async def set(self, key: str, data: bytes, ttl: int | None = None) -> bool:
-        """Cache image bytes.  Returns True on success, False = skipped."""
-        if not await self._ensure_connected():
-            return False
-        try:
-            await self._redis.set(key, data, ex=ttl)
-            return True
-        except Exception as e:
-            logger.warning("Redis set failed ({}).  Disconnecting.", e)
-            self._redis = None
-            return False
+    async def get(self, key):
+        # Bound the Redis response itself, including historical oversized images.
+        # GETRANGE's inclusive end gives one extra byte for the API's 413 check.
+        data = await self._operation("getrange", key, 0, settings.RENDER_MAX_IMAGE_BYTES)
+        return data or None
+
+    async def set(self, key, data, ttl=None):
+        return bool(await self._operation("set", key, data, ex=ttl))

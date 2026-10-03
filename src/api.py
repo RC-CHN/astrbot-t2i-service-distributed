@@ -1,35 +1,46 @@
 import asyncio
-import io
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 import fastapi
-from fastapi import BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import Response, JSONResponse
 from jinja2.exceptions import SecurityError
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
+from . import __version__
 from .cache import RedisImageCache
 from .config import settings
-from .render import ScreenshotOptions, Text2ImgRender
+from .concurrency import complete_before_cancel
+from .render import ScreenshotOptions, Text2ImgRender, RenderError, RenderLimitError
+from .limits import RequestBudgetMiddleware, log_rejection
 from .storage import storage_service
 from .util import get_image_lifetime, generate_data_path
 
 
 @asynccontextmanager
 async def lifespan(app: fastapi.FastAPI):
-    await cache.connect()
-    yield
-    await cache.disconnect()
+    await render.start()
+    await asyncio.gather(cache.connect(), storage_service.ensure_ready())
+    monitor = asyncio.create_task(_monitor_dependencies())
+    try:
+        yield
+    finally:
+        monitor.cancel()
+        with suppress(asyncio.CancelledError):
+            await monitor
+        await asyncio.gather(render.terminate(), cache.disconnect(), storage_service.close())
 
 
-app = fastapi.FastAPI(lifespan=lifespan)
+app = fastapi.FastAPI(lifespan=lifespan, version=__version__)
+app.add_middleware(RequestBudgetMiddleware)
 render = Text2ImgRender()
 cache = RedisImageCache()
 
 
 class GenerateRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     html: str | None = None
     tmpl: str | None = None
     tmplname: str | None = None
@@ -38,16 +49,56 @@ class GenerateRequest(BaseModel):
     as_json: bool = Field(default=False, alias="json")
 
 
-# ── Background S3 upload helper ────────────────────────────────────
+async def _persist_image(object_key: str, data: bytes, media_type: str) -> bool:
+    cached, uploaded = await asyncio.gather(
+        cache.set(object_key, data, ttl=get_image_lifetime()),
+        storage_service.aio_put_bytes(object_key, data, media_type),
+    )
+    if not uploaded:
+        logger.warning("S3 upload failed for {}; cached={}", object_key, cached)
+    return bool(uploaded)
 
-async def _bg_put_bytes(object_key: str, data: bytes, media_type: str) -> None:
-    """Background upload from bytes.  Used by json=true path (zero-file)."""
-    ok = await storage_service.aio_put_bytes(object_key, data, media_type)
-    if not ok:
-        logger.error(
-            "Background S3 put_bytes FAILED: {}.  Cached in Redis (TTL {:d}s).",
-            object_key, get_image_lifetime(),
-        )
+
+def _download_image(object_key):
+    stream = storage_service.download_stream(object_key)
+    if stream is None:
+        return None
+    try:
+        data = stream.read(settings.RENDER_MAX_IMAGE_BYTES + 1)
+        if len(data) > settings.RENDER_MAX_IMAGE_BYTES:
+            raise RenderLimitError("stored image exceeds byte limit",
+                budget="s3_image_bytes", actual=len(data), limit=settings.RENDER_MAX_IMAGE_BYTES)
+        return data
+    finally:
+        stream.close()
+
+
+async def _monitor_dependencies():
+    while True:
+        await asyncio.sleep(settings.S3_RETRY_INTERVAL)
+        # Recover the driver proactively: an unready worker may receive no user
+        # traffic, so recovery cannot depend on the next render request.
+        results = await asyncio.gather(render.start(),
+            storage_service.ensure_ready(force=True), cache.check(), return_exceptions=True)
+        for component, result in zip(("renderer", "s3", "redis"), results):
+            if isinstance(result, Exception):
+                logger.warning("Dependency {} check failed: {}", component, result)
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "live"}
+
+
+@app.get("/readyz")
+async def readyz():
+    # Cache-only workers can still serve existing images. New JSON generations
+    # explicitly return 503 until durable storage recovers.
+    available = render.healthy and (storage_service.ready or cache.healthy)
+    return JSONResponse(status_code=200 if available else 503,
+        content={"status": "ready" if available else "unavailable",
+                 "renderer": bool(render.healthy), "s3": bool(storage_service.ready),
+                 "redis": bool(cache.healthy)})
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -67,20 +118,26 @@ async def text2img_image(image_path: str):
         # 1) Redis cache
         cached = await cache.get(object_key)
         if cached is not None:
-            return StreamingResponse(io.BytesIO(cached), media_type=media_type)
+            if len(cached) > settings.RENDER_MAX_IMAGE_BYTES:
+                raise RenderLimitError("cached image exceeds byte limit",
+                    budget="redis_image_bytes", actual=len(cached), limit=settings.RENDER_MAX_IMAGE_BYTES)
+            return Response(cached, media_type=media_type)
 
         # 2) S3 fallback
-        stream = storage_service.download_stream(object_key)
-        if stream is None:
+        data = await complete_before_cancel(asyncio.to_thread(_download_image, object_key))
+        if data is None:
             return JSONResponse(
                 status_code=404,
                 content={"code": 1, "message": "file not found", "data": {}},
             )
-        data = stream.read()
         # Populate cache for next request (best-effort)
         await cache.set(object_key, data, ttl=get_image_lifetime())
-        return StreamingResponse(io.BytesIO(data), media_type=media_type)
+        return Response(data, media_type=media_type)
 
+    except RenderLimitError as exc:
+        log_rejection("download", exc.status_code, str(exc), **exc.details)
+        return JSONResponse(status_code=413,
+            content={"code": 1, "message": str(exc), "data": {}})
     except Exception as e:
         logger.error("Error fetching {}: {}", object_key, e)
         return JSONResponse(
@@ -92,7 +149,7 @@ async def text2img_image(image_path: str):
 @app.post("/text2img/generate")
 async def text2img(request: GenerateRequest):
     """
-    Render HTML → image, cache in Redis, schedule background S3 upload.
+    Render HTML → image, cache in Redis and upload within bounded admission.
     """
     is_json_return = request.as_json or False
 
@@ -112,7 +169,12 @@ async def text2img(request: GenerateRequest):
                 )
         elif request.tmplname:
             try:
-                tmpl = open(f"tmpl/{request.tmplname}.html", encoding="utf-8").read()
+                from pathlib import Path
+                template_root = Path("tmpl").resolve()
+                template_path = (template_root / f"{request.tmplname}.html").resolve()
+                if not template_path.is_relative_to(template_root):
+                    return JSONResponse(status_code=400, content={"code": 1, "message": "invalid template name", "data": {}})
+                tmpl = template_path.read_text(encoding="utf-8")
                 html_str = render.render_template(tmpl, request.tmpldata or {})
             except SecurityError as e:
                 return JSONResponse(
@@ -148,36 +210,25 @@ async def text2img(request: GenerateRequest):
         media_type = "image/png" if options.type != "jpeg" else "image/jpeg"
         suffix = options.type if options.type else "png"
 
-        # ── Render ─────────────────────────────────────────────────
+        # The HTTP path stays in memory for both response modes, so a client
+        # disconnect cannot strand a temporary image file before background cleanup.
+        image_bytes = await render.html2pic_bytes(html_str, options)
+        object_key, _ = generate_data_path(suffix=suffix, namespace="rendered")
+        object_key = object_key.replace("\\", "/")
+        persisted = await _persist_image(object_key, image_bytes, media_type)
         if is_json_return:
-            # Zero-file I/O path: render → bytes → cache → bg S3
-            image_bytes = await render.html2pic_bytes(html_str, options)
-            object_key, _ = generate_data_path(suffix=suffix, namespace="rendered")
-            object_key = object_key.replace("\\", "/")
-
-            await cache.set(object_key, image_bytes, ttl=get_image_lifetime())
-            logger.info("Cached {} in Redis", object_key)
-
-            asyncio.create_task(_bg_put_bytes(object_key, image_bytes, media_type))
-
+            if not persisted:
+                return JSONResponse(status_code=503, content={"code": 1, "message": "image storage unavailable", "data": {}}, headers={"Retry-After": "5"})
             return JSONResponse(
                 content={"code": 0, "message": "success", "data": {"id": object_key}},
             )
-        else:
-            # File path for FileResponse
-            pic_path = await render.html2pic_file(html_str, options)
-            object_key = pic_path.replace("\\", "/")
+        return Response(content=image_bytes, media_type=media_type)
 
-            with open(pic_path, "rb") as f:
-                image_bytes = f.read()
-            await cache.set(object_key, image_bytes, ttl=get_image_lifetime())
-
-            bg = BackgroundTasks()
-            # Upload from bytes we already have in memory — no file race.
-            bg.add_task(_bg_put_bytes, object_key, image_bytes, media_type)
-            bg.add_task(os.remove, pic_path)
-
-            return FileResponse(pic_path, media_type=media_type, background=bg)
+    except RenderError as e:
+        log_rejection("generate", e.status_code, str(e), **e.details)
+        return JSONResponse(status_code=e.status_code,
+            content={"code": 1, "message": str(e), "data": {}},
+            headers={"Retry-After": "2"} if e.status_code == 429 else None)
 
     except Exception as e:
         logger.error("Error during image generation: {}", e)

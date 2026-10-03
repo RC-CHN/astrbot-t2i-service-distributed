@@ -7,7 +7,13 @@
 -   **应用服务 (`app`)**: 负责接收请求、使用 Playwright 渲染图片、将图片上传到对象存储，并通过流式传输返回图片数据。
 -   **对象存储 (`minio`)**: 作为持久化层，存储所有生成的图片。
 
-为了 100% 保持对现有客户端的 API 兼容性，本服务直接处理所有数据请求，不依赖额外的缓存或重定向层。
+服务直接处理所有图片请求，使用 Redis 缓存和 S3 回源；客户端不需要跟随对象存储重定向。
+
+## v0.2.0：渲染内存保护与故障恢复
+
+本版本为请求、渲染、图片下载和上传设置明确的资源预算，按请求清理浏览器 context，并在存储故障后自动重试。配置、健康检查和新增 HTTP 状态码见 [运维说明](README_zh-CN.md#渲染资源保护与运维)，完整变更见 [CHANGELOG](CHANGELOG.md)。
+
+正式版本镜像：`ghcr.io/rc-chn/astrbot-t2i-service-distributed:0.2.0`（linux/amd64、linux/arm64）。
 
 ## 快速开始 (使用 Docker Compose)
 
@@ -99,7 +105,7 @@ A simple web service that converts HTML/templates to images, with image lifecycl
     1. Explicitly set in request options
     2. Auto-parsed from `<meta name="viewport" content="height=...">` in HTML
     3. Defaults to 720px if not specified and no meta tag found
-  - device_scale_factor_level (Literal["normal", "high", "ultra"], optional): Device pixel ratio level, default is "normal". Different levels use independent browser context pools for better performance and resource isolation.
+  - device_scale_factor_level (Literal["normal", "high", "ultra"], optional): Device pixel ratio level, default is "normal". Each render uses its own browser context.
     - `normal`: Device pixel ratio 1.0 (default)
     - `high`: Device pixel ratio 1.3
     - `ultra`: Device pixel ratio 1.8
@@ -113,4 +119,4 @@ A simple web service that converts HTML/templates to images, with image lifecycl
 
 **响应**:
 -   成功时：返回图片文件的二进制流。
--   失败时：返回 404 Not Found 或 500 Internal Server Error 的 JSON。
+-   失败时：返回 JSON 错误；图片不存在为 404，图片超过字节预算为 413，下载并发已满为 429，其他内部错误为 500。
